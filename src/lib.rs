@@ -26,22 +26,27 @@ mod event_audit_tests;
 mod integration_tests;
 
 #[cfg(test)]
+mod engine_property_tests;
+
+#[cfg(test)]
 mod policy_preset_tests;
 
-use engine::{cap_metrics, contains_addr, decide, AccountState, Decision};
+use engine::{cap_metrics, contains_addr, decide, effective_per_tx_cap, AccountState, Decision};
 use soroban_sdk::auth::{Context, ContractContext, CustomAccountInterface};
 use soroban_sdk::{
     contract, contractevent, contractimpl, panic_with_error, vec, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, TryFromVal, Val,
 };
+pub use types::MAX_AUTH_CONTEXTS;
 pub use types::NO_POLICY_DIGEST;
 pub use types::{
-    CheckDetail, Error, PolicyConfig, ProtocolRule, RecipientCap, RecipientWindowState,
+    AssetCap, CheckDetail, Error, PolicyConfig, ProtocolRule, RecipientCap, RecipientWindowState,
     ValidationOutcome,
 };
 use types::{
-    CheckResult, DataKey, PolicyRuleId, Status, WindowState, MAX_DMS_GRACE_SECS, MAX_POLICY_ASSETS,
-    MAX_POLICY_PROTOCOLS, MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
+    CheckResult, DataKey, PolicyRuleId, Status, WindowState, MAX_ASSET_CAP_ENTRIES,
+    MAX_DMS_GRACE_SECS, MAX_POLICY_ASSETS, MAX_POLICY_PROTOCOLS, MAX_RECIPIENT_ENTRIES,
+    MAX_WINDOW_SECS,
 };
 use window::{Ledger, WindowMerge, WindowMergeKind};
 
@@ -82,6 +87,13 @@ mod event_types {
     pub(super) struct EventHeartbeat {
         pub(super) at: u64,
         pub(super) expires_at: u64,
+    }
+
+    /// Dead-man switch auto-freeze explicitly recorded: data `at` (unix seconds).
+    #[contractevent]
+    #[derive(Clone)]
+    pub(super) struct EventDmsAutoFrozen {
+        pub(super) at: u64,
     }
 
     /// Admin lifecycle events: data `by` (the admin address that acted).
@@ -345,6 +357,73 @@ fn has_dup<T: PartialEq + TryFromVal<Env, Val> + IntoVal<Env, Val>>(
 /// or `Ok(())` when every rule passes. Pure logic over the candidate config —
 /// no storage access beyond `env.current_contract_address()` — so the
 /// `validate_policy` read can call it without touching state (issue #35).
+/// Recipient cap validation (SPEC §8): duplicate recipients, negative caps, a
+/// per-recipient cap with no window width, and self-address entries.
+fn first_failing_recipient_cap_rule(
+    cfg: &PolicyConfig,
+    self_addr: &Address,
+) -> Option<PolicyRuleId> {
+    for i in 0..cfg.recipient_window_caps.len() {
+        for j in (i + 1)..cfg.recipient_window_caps.len() {
+            if let (Some(a), Some(b)) = (
+                cfg.recipient_window_caps.get(i),
+                cfg.recipient_window_caps.get(j),
+            ) {
+                if a.recipient == b.recipient {
+                    return Some(PolicyRuleId::DuplicateRecipientCap);
+                }
+            }
+        }
+    }
+    for i in 0..cfg.recipient_window_caps.len() {
+        if let Some(rc) = cfg.recipient_window_caps.get(i) {
+            if rc.cap < 0 {
+                return Some(PolicyRuleId::RecipientCapSign);
+            }
+            if rc.cap > 0 && cfg.window_secs == 0 {
+                return Some(PolicyRuleId::WindowRequiresWidth);
+            }
+            // Same rule as `recipients`: a self-addressed cap entry is a
+            // meaningless no-op loop.
+            if rc.recipient == *self_addr {
+                return Some(PolicyRuleId::SelfAddressInList);
+            }
+        }
+    }
+    None
+}
+
+/// Per-asset cap validation (SPEC §8): negative caps, self-address entries,
+/// overrides for an asset not in `assets`, and duplicate asset entries.
+///
+/// An override for an asset absent from `assets` is rejected rather than
+/// silently ignored, so a mistyped asset address cannot look like it applies.
+fn first_failing_asset_cap_rule(cfg: &PolicyConfig, self_addr: &Address) -> Option<PolicyRuleId> {
+    for i in 0..cfg.asset_caps.len() {
+        if let Some(ac) = cfg.asset_caps.get(i) {
+            if ac.per_tx_cap < 0 {
+                return Some(PolicyRuleId::AmountSign);
+            }
+            if ac.asset == *self_addr {
+                return Some(PolicyRuleId::SelfAddressInList);
+            }
+            if !contains_addr(&cfg.assets, &ac.asset) {
+                return Some(PolicyRuleId::AssetCapUnknownAsset);
+            }
+        }
+    }
+    for i in 0..cfg.asset_caps.len() {
+        for j in (i + 1)..cfg.asset_caps.len() {
+            if let (Some(a), Some(b)) = (cfg.asset_caps.get(i), cfg.asset_caps.get(j)) {
+                if a.asset == b.asset {
+                    return Some(PolicyRuleId::DuplicateAssetCap);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn first_failing_rule(env: &Env, cfg: &PolicyConfig) -> Result<(), PolicyRuleId> {
     // Reject excessive vectors before content checks and duplicate scans, so
     // both validation cost and the later authorization scans stay bounded.
@@ -359,6 +438,9 @@ fn first_failing_rule(env: &Env, cfg: &PolicyConfig) -> Result<(), PolicyRuleId>
         || (cfg.blocked_recipients.len() as usize) > MAX_RECIPIENT_ENTRIES
     {
         return Err(PolicyRuleId::RecipientListTooLong);
+    }
+    if (cfg.asset_caps.len() as usize) > MAX_ASSET_CAP_ENTRIES {
+        return Err(PolicyRuleId::AssetCapListTooLong);
     }
     if cfg.per_tx_cap < 0 || cfg.window_cap < 0 {
         return Err(PolicyRuleId::AmountSign);
@@ -405,32 +487,11 @@ fn first_failing_rule(env: &Env, cfg: &PolicyConfig) -> Result<(), PolicyRuleId>
     {
         return Err(PolicyRuleId::DuplicateAddressInList);
     }
-    for i in 0..cfg.recipient_window_caps.len() {
-        for j in (i + 1)..cfg.recipient_window_caps.len() {
-            if let (Some(a), Some(b)) = (
-                cfg.recipient_window_caps.get(i),
-                cfg.recipient_window_caps.get(j),
-            ) {
-                if a.recipient == b.recipient {
-                    return Err(PolicyRuleId::DuplicateRecipientCap);
-                }
-            }
-        }
+    if let Some(rule) = first_failing_recipient_cap_rule(cfg, &self_addr) {
+        return Err(rule);
     }
-    for i in 0..cfg.recipient_window_caps.len() {
-        if let Some(rc) = cfg.recipient_window_caps.get(i) {
-            if rc.cap < 0 {
-                return Err(PolicyRuleId::RecipientCapSign);
-            }
-            if rc.cap > 0 && cfg.window_secs == 0 {
-                return Err(PolicyRuleId::WindowRequiresWidth);
-            }
-            // Same rule as `recipients`: a self-addressed cap entry is a
-            // meaningless no-op loop.
-            if rc.recipient == self_addr {
-                return Err(PolicyRuleId::SelfAddressInList);
-            }
-        }
+    if let Some(rule) = first_failing_asset_cap_rule(cfg, &self_addr) {
+        return Err(rule);
     }
     // A recipient cannot be both explicitly allowed and explicitly denied.
     for i in 0..cfg.recipients.len() {
@@ -502,6 +563,10 @@ fn emit_auth(env: &Env, allowed: bool, reason: Option<Error>, context_index: u32
 
 fn emit_heartbeat(env: &Env, at: u64, expires_at: u64) {
     EventHeartbeat { at, expires_at }.publish(env);
+}
+
+fn emit_dms_auto_frozen(env: &Env, at: u64) {
+    EventDmsAutoFrozen { at }.publish(env);
 }
 
 fn emit_initialized(env: &Env, by: &Address) {
@@ -761,6 +826,25 @@ mod policy_engine_type {
             emit_frozen(&env, &admin);
         }
 
+        /// Explicitly records and emits an event if the dead-man switch has expired.
+        /// This is permissionless (no auth required) because it only records an
+        /// already-true fact (the account is already lazily frozen by rule #2).
+        /// If the account is not expired, or already recorded, this is a no-op.
+        pub fn refresh_deadman(env: Env) {
+            let now = env.ledger().timestamp();
+            let grace =
+                persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
+            let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+
+            if grace > 0 && last_heartbeat != 0 && now.saturating_sub(last_heartbeat) > grace {
+                let recorded = persist_get::<u64>(&env, &DataKey::AutoFrozenAt).unwrap_or(0);
+                if recorded == 0 {
+                    persist_set(&env, &DataKey::AutoFrozenAt, &now);
+                    emit_dms_auto_frozen(&env, now);
+                }
+            }
+        }
+
         /// Admin liveness attestation: clears the admin freeze and restarts the
         /// heartbeat clock. One call, two jobs (SPEC §5 recorded decision): the
         /// brake release and the liveness attestation are combined on purpose —
@@ -973,7 +1057,7 @@ mod policy_engine_type {
 
             let (remaining_window, per_tx_cap, effective_window_cap) =
                 cap_metrics(&policy, &ledger, &to);
-            let effective_per_tx_cap = per_tx_cap;
+            let effective_per_tx_cap = effective_per_tx_cap(&policy, &asset);
             let call = transfer_context(&env, &asset, &to, amount);
             let verdicts = decide(
                 &env,
@@ -1053,7 +1137,9 @@ mod policy_engine_type {
 
             // 2. Verify the agent's Ed25519 signature over the auth payload. The
             //    host crypto function traps the frame on a bad signature, so a
-            //    wrong key can never reach policy evaluation.
+            //    wrong key can never reach policy evaluation. This ordering is a
+            //    stated guarantee with named enforcing tests and a refactor
+            //    warning in SPEC §10.2 — do not move a read above this call.
             let message: Bytes = signature_payload.into();
             env.crypto().ed25519_verify(&agent, &message, &signatures);
 
@@ -1139,12 +1225,15 @@ pub use policy_engine_type::PolicyEngineClient;
 #[allow(clippy::must_use_candidate, clippy::len_without_is_empty)]
 #[allow(missing_docs)] // Test-only helper re-exports are not contract API.
 pub mod testutils {
-    pub use crate::engine::{contains_addr, decide, parse_call, AccountState, Decision};
+    pub use crate::engine::{
+        contains_addr, decide, parse_call, worst_case_transfer_policy, worst_case_transfer_target,
+        AccountState, Decision,
+    };
     pub use crate::types::policy_canonical_encoding;
     pub use crate::types::{
         CheckResult, DataKey, Error, PolicyConfig, PolicyRuleId, ProtocolRule, RecipientCap,
-        RecipientWindowState, Status, ValidationOutcome, WindowState, MAX_DMS_GRACE_SECS,
-        MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
+        RecipientWindowState, Status, ValidationOutcome, WindowState, MAX_AUTH_CONTEXTS,
+        MAX_DMS_GRACE_SECS, MAX_RECIPIENT_ENTRIES, MAX_WINDOW_SECS,
     };
     pub use crate::window::Ledger;
     pub use soroban_sdk::auth::{Context, ContractContext};

@@ -39,6 +39,7 @@ pub fn confirm_admin_rotation(env: Env)
 pub fn cancel_admin_rotation(env: Env)
 pub fn heartbeat(env: Env)
 pub fn freeze(env: Env)
+pub fn refresh_deadman(env: Env)
 pub fn unfreeze(env: Env)
 pub fn policy(env: Env) -> Option<PolicyConfig>
 pub fn policy_hash(env: Env) -> BytesN<32>
@@ -70,6 +71,9 @@ enum PolicyRuleId
   AssetListTooLong
   ProtocolListTooLong
   PerTxCapExceedsWindowCap
+  AssetCapListTooLong
+  AssetCapUnknownAsset
+  DuplicateAssetCap
 enum ValidationOutcome
   Valid
   Invalid(PolicyRuleId)
@@ -91,6 +95,10 @@ struct ProtocolCallEntry
 struct RecipientCap
   recipient: Address
   cap: i128
+struct AssetCap
+  asset: Address
+  per_tx_cap: i128
+  paused: bool
 struct PolicyConfig
   per_tx_cap: i128
   window_secs: u64
@@ -100,6 +108,7 @@ struct PolicyConfig
   recipients: Vec<Address>
   recipient_window_caps: Vec<RecipientCap>
   blocked_recipients: Vec<Address>
+  asset_caps: Vec<AssetCap>
   allow_any_recipient: bool
   active_from: u64
   active_until: u64
@@ -109,6 +118,7 @@ struct PolicyConfig
 struct ProtocolRule
   contract: Address
   fns: Option<Vec<Symbol>>
+  paused: bool
 struct Status
   has_policy: bool
   policy_revision: u64
@@ -137,6 +147,7 @@ enum DataKey
   Window
   LastHeartbeat
   AdminFrozen
+  AutoFrozenAt
   PolicyRevision
 struct RecipientLedger
   recipient: Address
@@ -161,9 +172,11 @@ struct RecipientLedger
 23 WindowCapExceeded window_cap_exceeded
 24 ProtocolNotAllowed protocol_not_allowed
 25 FunctionNotAllowed function_not_allowed
+32 AssetFnNotAllowed asset_fn_not_allowed
 26 UnknownContract unknown_contract
 27 SelfFunctionNotAllowed self_function_not_allowed
 28 CreateContractNotAllowed create_contract_not_allowed
 29 RecipientBlocked recipient_blocked
 30 ProtocolCallRateExceeded protocol_call_rate_exceeded
 31 DecisionInvariantViolation decision_invariant_violation
+33 TooManyAuthContexts too_many_auth_contexts
